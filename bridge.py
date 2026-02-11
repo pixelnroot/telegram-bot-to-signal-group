@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Telegram → Signal Bridge (Passcode-Protected)
+Telegram → Signal Bridge (Multi-Group, Passcode-Protected)
 
-Users DM this bot, authenticate with a passcode, then anything they
-send gets forwarded to a configured Signal group via signal-cli-rest-api.
+Flow:
+  1. /start            → Welcome message
+  2. /login <passcode> → Authenticate (single shared passcode)
+  3. /groups           → List available Signal groups
+  4. /join <group>     → Select which Signal group to forward to
+  5. Send any message  → Forwarded to the user's assigned Signal group
+  6. /switch <group>   → Change to a different group
+  7. /logout           → Revoke access
 """
 
 import os
@@ -21,19 +27,59 @@ from telegram.ext import (
     filters,
 )
 
-# ─── Configuration (from environment variables) ─────────────────────────────
+# ─── Configuration ───────────────────────────────────────────────────────────
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 SIGNAL_API_URL = os.environ.get("SIGNAL_API_URL", "http://signal-api:8080")
 SIGNAL_PHONE_NUMBER = os.environ.get("SIGNAL_PHONE_NUMBER", "")
-SIGNAL_GROUP_ID = os.environ.get("SIGNAL_GROUP_ID", "")
 PASSCODE = os.environ.get("BOT_PASSCODE", "")
 FORWARD_PREFIX = os.environ.get("FORWARD_PREFIX", "[Telegram]")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
-# Store authenticated user IDs (persisted to disk so it survives restarts)
-authenticated_users: dict[int, str] = {}  # user_id → display_name
-AUTH_FILE = "/app/data/authenticated_users.json"
+# ─── Signal Groups Config ───────────────────────────────────────────────────
+# Define your groups in SIGNAL_GROUPS env var as JSON:
+#   SIGNAL_GROUPS={"general":"group.abc123","alerts":"group.def456","dev":"group.ghi789"}
+#
+# Users will type /join general, /join alerts, etc.
+
+SIGNAL_GROUPS: dict[str, str] = {}  # name → group_id
+
+
+def load_groups_config():
+    """Load group mappings from SIGNAL_GROUPS env var."""
+    global SIGNAL_GROUPS
+    raw = os.environ.get("SIGNAL_GROUPS", "")
+    if raw:
+        try:
+            SIGNAL_GROUPS = json.loads(raw)
+            logger.info(
+                f"Loaded {len(SIGNAL_GROUPS)} Signal group(s): {', '.join(SIGNAL_GROUPS.keys())}"
+            )
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid SIGNAL_GROUPS JSON: {e}")
+            sys.exit(1)
+    else:
+        # Fallback: single group from SIGNAL_GROUP_ID
+        single = os.environ.get("SIGNAL_GROUP_ID", "")
+        if single:
+            SIGNAL_GROUPS["default"] = single
+            logger.info("Using single group mode (SIGNAL_GROUP_ID)")
+        else:
+            logger.error("No groups configured. Set SIGNAL_GROUPS or SIGNAL_GROUP_ID.")
+            sys.exit(1)
+
+
+# ─── User Data ───────────────────────────────────────────────────────────────
+# Structure:
+# {
+#     user_id: {
+#         "name": "John Doe",
+#         "group": "general"     ← currently assigned group (None if not yet joined)
+#     }
+# }
+
+users_data: dict[int, dict] = {}
+DATA_FILE = "/app/data/users_data.json"
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -46,28 +92,28 @@ logger = logging.getLogger("bridge")
 # ─── Persistence ─────────────────────────────────────────────────────────────
 
 
-def load_authenticated_users():
-    """Load authenticated users from disk (survives restarts)."""
-    global authenticated_users
+def load_users():
+    """Load user data from disk."""
+    global users_data
     try:
-        os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
-        if os.path.exists(AUTH_FILE):
-            with open(AUTH_FILE, "r") as f:
-                data = json.load(f)
-                authenticated_users = {int(k): v for k, v in data.items()}
-                logger.info(f"Loaded {len(authenticated_users)} authenticated user(s)")
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                raw = json.load(f)
+                users_data = {int(k): v for k, v in raw.items()}
+                logger.info(f"Loaded {len(users_data)} user(s)")
     except Exception as e:
-        logger.warning(f"Could not load auth file: {e}")
+        logger.warning(f"Could not load data file: {e}")
 
 
-def save_authenticated_users():
-    """Save authenticated users to disk."""
+def save_users():
+    """Save user data to disk."""
     try:
-        os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
-        with open(AUTH_FILE, "w") as f:
-            json.dump({str(k): v for k, v in authenticated_users.items()}, f)
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        with open(DATA_FILE, "w") as f:
+            json.dump({str(k): v for k, v in users_data.items()}, f, indent=2)
     except Exception as e:
-        logger.warning(f"Could not save auth file: {e}")
+        logger.warning(f"Could not save data file: {e}")
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -80,8 +126,6 @@ def validate_config():
         missing.append("TELEGRAM_BOT_TOKEN")
     if not SIGNAL_PHONE_NUMBER:
         missing.append("SIGNAL_PHONE_NUMBER")
-    if not SIGNAL_GROUP_ID:
-        missing.append("SIGNAL_GROUP_ID")
     if not PASSCODE:
         missing.append("BOT_PASSCODE")
     if missing:
@@ -89,13 +133,31 @@ def validate_config():
         sys.exit(1)
 
 
-def send_to_signal(text: str, base64_attachments: list[str] | None = None):
-    """Send a message to the configured Signal group."""
+def is_authenticated(user_id: int) -> bool:
+    return user_id in users_data
+
+
+def has_group(user_id: int) -> bool:
+    return is_authenticated(user_id) and users_data[user_id].get("group") is not None
+
+
+def get_user_group_id(user_id: int) -> str | None:
+    """Get the Signal group ID for a user's assigned group."""
+    if not has_group(user_id):
+        return None
+    group_name = users_data[user_id]["group"]
+    return SIGNAL_GROUPS.get(group_name)
+
+
+def send_to_signal(
+    group_id: str, text: str, base64_attachments: list[str] | None = None
+) -> bool:
+    """Send a message to a specific Signal group."""
     url = f"{SIGNAL_API_URL}/v2/send"
     payload = {
         "message": text,
         "number": SIGNAL_PHONE_NUMBER,
-        "recipients": [SIGNAL_GROUP_ID],
+        "recipients": [group_id],
     }
     if base64_attachments:
         payload["base64_attachments"] = base64_attachments
@@ -103,7 +165,7 @@ def send_to_signal(text: str, base64_attachments: list[str] | None = None):
     try:
         resp = requests.post(url, json=payload, timeout=30)
         resp.raise_for_status()
-        logger.info("Message forwarded to Signal successfully.")
+        logger.info(f"Message forwarded to Signal group {group_id}")
         return True
     except requests.RequestException as e:
         logger.error(f"Failed to send to Signal: {e}")
@@ -113,11 +175,12 @@ def send_to_signal(text: str, base64_attachments: list[str] | None = None):
 
 
 def build_message_text(update: Update) -> str:
-    """Build a human-readable forwarded message string."""
+    """Build a forwarded message string with sender info."""
     msg = update.message
     sender = msg.from_user
-    sender_name = (
-        authenticated_users.get(sender.id, sender.full_name) if sender else "Unknown"
+    user_id = sender.id if sender else 0
+    sender_name = users_data.get(user_id, {}).get(
+        "name", sender.full_name if sender else "Unknown"
     )
 
     parts = [f"{FORWARD_PREFIX} {sender_name}:"]
@@ -155,7 +218,7 @@ def build_message_text(update: Update) -> str:
 
 
 async def download_attachment(update: Update) -> str | None:
-    """Download a photo/document/video from Telegram and return base64."""
+    """Download attachment from Telegram and return base64."""
     msg = update.message
     file_obj = None
 
@@ -182,6 +245,15 @@ async def download_attachment(update: Update) -> str | None:
     return None
 
 
+def format_groups_list() -> str:
+    """Format available groups as a readable list."""
+    lines = ["📋 Available groups:\n"]
+    for name in sorted(SIGNAL_GROUPS.keys()):
+        lines.append(f"  • {name}")
+    lines.append("\nUse /join <group_name> to select one.")
+    return "\n".join(lines)
+
+
 # ─── Command Handlers ────────────────────────────────────────────────────────
 
 
@@ -189,47 +261,60 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     user_id = update.effective_user.id
 
-    if user_id in authenticated_users:
+    if has_group(user_id):
+        group_name = users_data[user_id]["group"]
         await update.message.reply_text(
-            "✅ You're already authenticated!\n\n"
-            "Just send me any message and I'll forward it to the Signal group.\n\n"
+            f"✅ You're authenticated and sending to: {group_name}\n\n"
+            "Just send me any message and I'll forward it.\n\n"
             "Commands:\n"
-            "/status — Check your auth status\n"
-            "/logout — Revoke your access"
+            "/groups  — List available groups\n"
+            "/switch <group> — Change your group\n"
+            "/status  — Check your status\n"
+            "/logout  — Revoke your access"
+        )
+    elif is_authenticated(user_id):
+        await update.message.reply_text(
+            "✅ You're authenticated but haven't joined a group yet.\n\n"
+            f"{format_groups_list()}"
         )
     else:
         await update.message.reply_text(
-            "👋 Welcome! This bot forwards messages to a Signal group.\n\n"
-            "To get started, authenticate with the passcode:\n"
-            "/login <passcode>\n\n"
-            "Example: /login mysecretcode"
+            "👋 Welcome! This bot forwards your messages to a Signal group.\n\n"
+            "Step 1: Authenticate\n"
+            "  /login <passcode>\n\n"
+            "Step 2: Choose a group\n"
+            "  /groups — see available groups\n"
+            "  /join <group_name> — select your group\n\n"
+            "Step 3: Send messages!\n"
+            "  Anything you send will be forwarded to your Signal group."
         )
 
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /login <passcode> command."""
+    """Handle /login <passcode>."""
     user = update.effective_user
     user_id = user.id
 
-    if user_id in authenticated_users:
+    if is_authenticated(user_id):
         await update.message.reply_text("✅ You're already authenticated!")
         return
 
     if not context.args:
-        await update.message.reply_text(
-            "❌ Please provide the passcode.\n" "Usage: /login <passcode>"
-        )
+        await update.message.reply_text("❌ Usage: /login <passcode>")
         return
 
     entered = " ".join(context.args)
 
     if entered == PASSCODE:
         display_name = user.full_name or user.username or str(user_id)
-        authenticated_users[user_id] = display_name
-        save_authenticated_users()
+        users_data[user_id] = {
+            "name": display_name,
+            "group": None,
+        }
+        save_users()
         logger.info(f"User authenticated: {display_name} (ID: {user_id})")
 
-        # Delete the login message so the passcode isn't visible in chat history
+        # Delete the login message so passcode isn't visible
         try:
             await update.message.delete()
         except Exception:
@@ -239,8 +324,8 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=user_id,
             text=(
                 f"✅ Welcome, {display_name}! You're now authenticated.\n\n"
-                "Send me any message (text, photo, file, etc.) and "
-                "I'll forward it to the Signal group."
+                "Now choose a group to send messages to:\n\n"
+                f"{format_groups_list()}"
             ),
         )
     else:
@@ -248,13 +333,96 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Wrong passcode. Try again.")
 
 
-async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /logout command."""
+async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /groups — list available Signal groups."""
     user_id = update.effective_user.id
 
-    if user_id in authenticated_users:
-        name = authenticated_users.pop(user_id)
-        save_authenticated_users()
+    if not is_authenticated(user_id):
+        await update.message.reply_text("🔒 Authenticate first: /login <passcode>")
+        return
+
+    current = users_data[user_id].get("group")
+    text = format_groups_list()
+    if current:
+        text += f"\n\n✅ You're currently in: {current}"
+
+    await update.message.reply_text(text)
+
+
+async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /join <group_name> — assign user to a Signal group."""
+    user_id = update.effective_user.id
+
+    if not is_authenticated(user_id):
+        await update.message.reply_text("🔒 Authenticate first: /login <passcode>")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            f"❌ Usage: /join <group_name>\n\n{format_groups_list()}"
+        )
+        return
+
+    group_name = " ".join(context.args).strip().lower()
+
+    # Case-insensitive lookup
+    matched = None
+    for name in SIGNAL_GROUPS:
+        if name.lower() == group_name:
+            matched = name
+            break
+
+    if not matched:
+        await update.message.reply_text(
+            f'❌ Group "{group_name}" not found.\n\n{format_groups_list()}'
+        )
+        return
+
+    users_data[user_id]["group"] = matched
+    save_users()
+    logger.info(f"User {users_data[user_id]['name']} joined group: {matched}")
+
+    await update.message.reply_text(
+        f"✅ You're now sending to: {matched}\n\n"
+        "Send me any message and I'll forward it to this Signal group!"
+    )
+
+
+async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /switch <group_name> — change to a different group."""
+    # Same logic as /join
+    await cmd_join(update, context)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status — show current auth & group status."""
+    user_id = update.effective_user.id
+
+    if not is_authenticated(user_id):
+        await update.message.reply_text("❌ Not authenticated. Use /login <passcode>")
+        return
+
+    data = users_data[user_id]
+    group = data.get("group")
+
+    if group:
+        await update.message.reply_text(
+            f"✅ Authenticated as: {data['name']}\n" f"📬 Forwarding to: {group}"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Authenticated as: {data['name']}\n"
+            f"⚠️ No group selected yet. Use /join <group_name>"
+        )
+
+
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /logout — remove user."""
+    user_id = update.effective_user.id
+
+    if user_id in users_data:
+        name = users_data.pop(user_id)["name"]
+        save_users()
         logger.info(f"User logged out: {name} (ID: {user_id})")
         await update.message.reply_text(
             "👋 You've been logged out. Use /login <passcode> to re-authenticate."
@@ -263,47 +431,49 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You're not logged in.")
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command."""
-    user_id = update.effective_user.id
-
-    if user_id in authenticated_users:
-        await update.message.reply_text(
-            f"✅ Authenticated as: {authenticated_users[user_id]}\n"
-            "All your messages are being forwarded to the Signal group."
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Not authenticated.\n" "Use /login <passcode> to get started."
-        )
-
-
 # ─── Message Handler ─────────────────────────────────────────────────────────
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all non-command messages from authenticated users."""
+    """Handle all non-command messages — forward to Signal."""
     if not update.message or not update.effective_user:
         return
 
     user_id = update.effective_user.id
 
-    # Check authentication
-    if user_id not in authenticated_users:
+    # Not authenticated
+    if not is_authenticated(user_id):
         await update.message.reply_text(
             "🔒 You need to authenticate first.\n" "Use /login <passcode>"
         )
         return
 
-    # Build the message and forward to Signal
+    # Authenticated but no group selected
+    if not has_group(user_id):
+        await update.message.reply_text(
+            f"⚠️ You haven't joined a group yet.\n\n{format_groups_list()}"
+        )
+        return
+
+    # Get the Signal group ID
+    group_id = get_user_group_id(user_id)
+    if not group_id:
+        group_name = users_data[user_id]["group"]
+        await update.message.reply_text(
+            f'❌ Group "{group_name}" is no longer configured. Use /groups to pick another.'
+        )
+        return
+
+    # Build and forward
     text = build_message_text(update)
     attachment = await download_attachment(update)
     attachments = [attachment] if attachment else None
 
-    success = send_to_signal(text, base64_attachments=attachments)
+    success = send_to_signal(group_id, text, base64_attachments=attachments)
 
+    group_name = users_data[user_id]["group"]
     if success:
-        await update.message.reply_text("✅ Forwarded to Signal!")
+        await update.message.reply_text(f"✅ Forwarded to [{group_name}]")
     else:
         await update.message.reply_text("⚠️ Failed to forward. Check the bot logs.")
 
@@ -313,22 +483,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     validate_config()
-    load_authenticated_users()
+    load_users()
+    load_groups_config()
 
-    logger.info("Starting Telegram → Signal bridge (passcode-protected)...")
+    logger.info("Starting Telegram → Signal bridge (multi-group)...")
     logger.info(f"Signal API: {SIGNAL_API_URL}")
     logger.info(f"Signal number: {SIGNAL_PHONE_NUMBER}")
-    logger.info(f"Signal group: {SIGNAL_GROUP_ID}")
+    logger.info(f"Available groups: {list(SIGNAL_GROUPS.keys())}")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Register command handlers
+    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("login", cmd_login))
-    app.add_handler(CommandHandler("logout", cmd_logout))
+    app.add_handler(CommandHandler("groups", cmd_groups))
+    app.add_handler(CommandHandler("join", cmd_join))
+    app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("logout", cmd_logout))
 
-    # Forward all other messages (text, photos, files, etc.)
+    # Forward all non-command messages
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
 
     logger.info("Bot is polling for messages...")
