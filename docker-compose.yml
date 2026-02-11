@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  # ── Signal CLI REST API ──────────────────────────────────────────────
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: signal-api
+    restart: unless-stopped
+    environment:
+      - MODE=json-rpc
+    ports:
+      - "9922:8080" # Swagger UI at http://localhost:8080
+    volumes:
+      - ./signal-cli-config:/home/.local/share/signal-cli
+
+  # ── Telegram → Signal Bridge ─────────────────────────────────────────
+  bridge:
+    build: .
+    container_name: telegram-signal-bridge
+    restart: unless-stopped
+    depends_on:
+      - signal-api
+    env_file:
+      - .env
+    environment:
+      - SIGNAL_API_URL=http://signal-api:8080
+    volumes:
+      - ./bridge-data:/app/data # persists authenticated users across restarts
