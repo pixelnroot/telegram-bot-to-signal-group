@@ -175,15 +175,10 @@ def send_to_signal(
 
 
 def build_message_text(update: Update) -> str:
-    """Build a forwarded message string with sender info."""
+    """Build a forwarded message string."""
     msg = update.message
-    sender = msg.from_user
-    user_id = sender.id if sender else 0
-    sender_name = users_data.get(user_id, {}).get(
-        "name", sender.full_name if sender else "Unknown"
-    )
 
-    parts = [f"{FORWARD_PREFIX} {sender_name}:"]
+    parts = []
 
     if msg.text:
         parts.append(msg.text)
