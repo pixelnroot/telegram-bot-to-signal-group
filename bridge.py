@@ -112,27 +112,41 @@ def init_db():
             status TEXT DEFAULT 'queued',
             attempts INTEGER DEFAULT 0,
             error TEXT,
-            delivered_at REAL
+            delivered_at REAL,
+            signal_timestamp INTEGER,
+            group_id TEXT
         )
     """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON message_logs(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON message_logs(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_group ON message_logs(group_name)")
+    # Migration: add columns if they don't exist
+    try:
+        conn.execute("ALTER TABLE message_logs ADD COLUMN signal_timestamp INTEGER")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE message_logs ADD COLUMN group_id TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
 
-def db_insert_message(user_id, user_name, group_name, preview, has_attachment=False):
+def db_insert_message(
+    user_id, user_name, group_name, group_id, preview, has_attachment=False
+):
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.execute(
-            "INSERT INTO message_logs (timestamp, user_id, user_name, group_name, message_preview, has_attachment, status) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
+            "INSERT INTO message_logs (timestamp, user_id, user_name, group_name, group_id, message_preview, has_attachment, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')",
             (
                 time.time(),
                 user_id,
                 user_name,
                 group_name,
+                group_id,
                 preview[:200],
                 int(has_attachment),
             ),
@@ -146,15 +160,15 @@ def db_insert_message(user_id, user_name, group_name, preview, has_attachment=Fa
         return None
 
 
-def db_update_message(log_id, status, attempts=1, error=None):
+def db_update_message(log_id, status, attempts=1, error=None, signal_timestamp=None):
     if not log_id:
         return
     try:
         conn = sqlite3.connect(DB_PATH)
         delivered = time.time() if status == "sent" else None
         conn.execute(
-            "UPDATE message_logs SET status=?, attempts=?, error=?, delivered_at=? WHERE id=?",
-            (status, attempts, error, delivered, log_id),
+            "UPDATE message_logs SET status=?, attempts=?, error=?, delivered_at=?, signal_timestamp=? WHERE id=?",
+            (status, attempts, error, delivered, signal_timestamp, log_id),
         )
         conn.commit()
         conn.close()
@@ -191,8 +205,8 @@ http_session: aiohttp.ClientSession = None
 bot_instance: Bot = None
 
 
-async def send_to_signal(msg: QueuedMessage) -> bool:
-    """Send a message to Signal via the REST API. Returns True on success."""
+async def send_to_signal(msg: QueuedMessage) -> tuple[bool, int | None]:
+    """Send a message to Signal via the REST API. Returns (success, signal_timestamp)."""
     url = f"{SIGNAL_API_URL}/v2/send"
     payload = {
         "message": msg.text,
@@ -207,16 +221,30 @@ async def send_to_signal(msg: QueuedMessage) -> bool:
             url, json=payload, timeout=aiohttp.ClientTimeout(total=SEND_TIMEOUT)
         ) as resp:
             if resp.status == 200 or resp.status == 201:
-                return True
+                try:
+                    data = await resp.json()
+                    # The API returns a timestamp we need for remote-delete
+                    signal_ts = None
+                    if isinstance(data, dict):
+                        signal_ts = data.get("timestamp")
+                    elif isinstance(data, list) and len(data) > 0:
+                        signal_ts = (
+                            data[0].get("timestamp")
+                            if isinstance(data[0], dict)
+                            else None
+                        )
+                    return True, signal_ts
+                except Exception:
+                    return True, None
             body = await resp.text()
             logger.error(f"Signal API returned {resp.status}: {body}")
-            return False
+            return False, None
     except asyncio.TimeoutError:
         logger.error("Signal API request timed out")
-        return False
+        return False, None
     except Exception as e:
         logger.error(f"Signal API error: {e}")
-        return False
+        return False, None
 
 
 async def notify_user(chat_id: int, text: str):
@@ -236,14 +264,16 @@ async def queue_worker(worker_id: int):
 
         try:
             msg.attempts += 1
-            success = await send_to_signal(msg)
+            success, signal_ts = await send_to_signal(msg)
 
             if success:
                 stats["sent"] += 1
-                db_update_message(msg.db_log_id, "sent", msg.attempts)
+                db_update_message(
+                    msg.db_log_id, "sent", msg.attempts, signal_timestamp=signal_ts
+                )
                 logger.info(
                     f"[Worker #{worker_id}] ✅ Sent to [{msg.group_name}] "
-                    f"(attempt {msg.attempts}, queue size: {message_queue.qsize()})"
+                    f"(attempt {msg.attempts}, ts={signal_ts}, queue size: {message_queue.qsize()})"
                 )
                 await notify_user(msg.chat_id, f"✅ Sent to [{msg.group_name}]")
 
@@ -302,6 +332,7 @@ async def enqueue_message(
         user_id=user_id,
         user_name=user_name,
         group_name=group_name,
+        group_id=group_id,
         preview=original_text,
         has_attachment=base64_attachments is not None,
     )

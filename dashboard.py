@@ -16,6 +16,7 @@ import os
 import json
 import time
 import sqlite3
+import requests
 from datetime import datetime
 from functools import wraps
 from flask import (
@@ -36,6 +37,8 @@ SECRET_KEY = os.environ.get("FLASK_SECRET", "change-me-to-something-random")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/bridge_logs.db")
 USERS_FILE = os.environ.get("USERS_FILE", "/app/data/users_data.json")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
+SIGNAL_API_URL = os.environ.get("SIGNAL_API_URL", "http://signal-api:8080")
+SIGNAL_PHONE_NUMBER = os.environ.get("SIGNAL_PHONE_NUMBER", "")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -353,6 +356,63 @@ def remove_user(user_id):
     return redirect(url_for("users"))
 
 
+@app.route("/messages/delete/<int:msg_id>", methods=["POST"])
+@login_required
+def delete_message(msg_id):
+    """Delete a sent message from Signal using remote-delete."""
+    conn = get_db()
+    msg = conn.execute("SELECT * FROM message_logs WHERE id = ?", (msg_id,)).fetchone()
+
+    if not msg:
+        flash("Message not found", "error")
+        conn.close()
+        return redirect(url_for("messages"))
+
+    if msg["status"] != "sent":
+        flash("Can only delete sent messages", "error")
+        conn.close()
+        return redirect(url_for("messages"))
+
+    signal_ts = msg["signal_timestamp"]
+    group_id = msg["group_id"]
+
+    if not signal_ts:
+        flash(
+            "Cannot delete: no Signal timestamp recorded (message sent before this feature was added)",
+            "error",
+        )
+        conn.close()
+        return redirect(url_for("messages"))
+
+    if not group_id:
+        flash("Cannot delete: no group ID recorded", "error")
+        conn.close()
+        return redirect(url_for("messages"))
+
+    # Call Signal API remote-delete endpoint
+    try:
+        url = f"{SIGNAL_API_URL}/v1/messages/{SIGNAL_PHONE_NUMBER}"
+        payload = {
+            "recipients": [group_id],
+            "timestamp": signal_ts,
+        }
+        resp = requests.delete(url, json=payload, timeout=30)
+
+        if resp.status_code in (200, 201, 204):
+            conn.execute(
+                "UPDATE message_logs SET status='deleted' WHERE id=?", (msg_id,)
+            )
+            conn.commit()
+            flash("Message deleted from Signal group", "success")
+        else:
+            flash(f"Signal API error ({resp.status_code}): {resp.text}", "error")
+    except Exception as e:
+        flash(f"Delete failed: {str(e)}", "error")
+
+    conn.close()
+    return redirect(url_for("messages"))
+
+
 @app.route("/api/stats")
 @login_required
 def api_stats():
@@ -423,6 +483,7 @@ BASE_STYLE = """
     .badge-sent { background: #1b3d2f; color: #3fb950; }
     .badge-failed { background: #3d1b1b; color: #f85149; }
     .badge-queued { background: #2d2a1b; color: #d29922; }
+    .badge-deleted { background: #2d1b3d; color: #bc8cff; }
     .badge-group { background: #1b2d3d; color: #58a6ff; }
 
     .filters { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
@@ -666,6 +727,7 @@ MESSAGES_HTML = (
                 <option value="sent" {% if status=='sent' %}selected{% endif %}>✅ Sent</option>
                 <option value="failed" {% if status=='failed' %}selected{% endif %}>❌ Failed</option>
                 <option value="queued" {% if status=='queued' %}selected{% endif %}>⏳ Queued</option>
+                <option value="deleted" {% if status=='deleted' %}selected{% endif %}>🗑️ Deleted</option>
             </select>
             <select name="group">
                 <option value="all" {% if group=='all' %}selected{% endif %}>All Groups</option>
@@ -678,7 +740,7 @@ MESSAGES_HTML = (
         </form>
 
         <table>
-            <tr><th>Time</th><th>User</th><th>Group</th><th>Message</th><th>Attempts</th><th>Status</th></tr>
+            <tr><th>Time</th><th>User</th><th>Group</th><th>Message</th><th>Attempts</th><th>Status</th><th>Action</th></tr>
             {% for m in logs %}
             <tr>
                 <td>{{ time_ago(m.timestamp) }}</td>
@@ -690,10 +752,21 @@ MESSAGES_HTML = (
                     <span class="badge badge-{{ m.status }}">{{ m.status }}</span>
                     {% if m.error %}<br><small style="color:#f85149">{{ m.error }}</small>{% endif %}
                 </td>
+                <td>
+                    {% if m.status == 'sent' and m.signal_timestamp %}
+                    <form method="POST" action="/messages/delete/{{ m.id }}" style="display:inline" onsubmit="return confirm('Delete this message from Signal?')">
+                        <button type="submit" class="btn btn-danger">🗑️ Unsend</button>
+                    </form>
+                    {% elif m.status == 'deleted' %}
+                    <span style="color:#bc8cff;font-size:12px;">Deleted</span>
+                    {% else %}
+                    <span style="color:#8b949e;font-size:12px;">—</span>
+                    {% endif %}
+                </td>
             </tr>
             {% endfor %}
             {% if not logs %}
-            <tr><td colspan="6" style="color:#8b949e;text-align:center;padding:20px;">No messages match your filters</td></tr>
+            <tr><td colspan="7" style="color:#8b949e;text-align:center;padding:20px;">No messages match your filters</td></tr>
             {% endif %}
         </table>
 
