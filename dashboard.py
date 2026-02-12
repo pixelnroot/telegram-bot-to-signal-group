@@ -391,9 +391,9 @@ def delete_message(msg_id):
 
     # Call Signal API remote-delete endpoint
     try:
-        url = f"{SIGNAL_API_URL}/v1/messages/{SIGNAL_PHONE_NUMBER}"
+        url = f"{SIGNAL_API_URL}/v1/remote-delete/{SIGNAL_PHONE_NUMBER}"
         payload = {
-            "recipients": [group_id],
+            "recipient": group_id,
             "timestamp": signal_ts,
         }
         resp = requests.delete(url, json=payload, timeout=30)
