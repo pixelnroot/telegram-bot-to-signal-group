@@ -1,5 +1,4 @@
 version: "3.8"
-
 services:
   # ── Signal CLI REST API ──────────────────────────────────────────────
   signal-api:
@@ -7,9 +6,9 @@ services:
     container_name: signal-api
     restart: unless-stopped
     environment:
-      - MODE=normal
+      - MODE=json-rpc
     ports:
-      - "9922:8080" # Swagger UI at http://localhost:8080
+      - "9922:8080"
     volumes:
       - ./signal-cli-config:/home/.local/share/signal-cli
 
@@ -25,4 +24,21 @@ services:
     environment:
       - SIGNAL_API_URL=http://signal-api:8080
     volumes:
-      - ./bridge-data:/app/data # persists authenticated users across restarts
+      - ./bridge-data:/app/data
+
+  # ── Admin Dashboard ─────────────────────────────────────────────────
+  dashboard:
+    build: .
+    container_name: bridge-dashboard
+    restart: unless-stopped
+    command: python -u dashboard.py
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=/app/data/bridge_logs.db
+      - USERS_FILE=/app/data/users_data.json
+      - DASHBOARD_PORT=8765
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./bridge-data:/app/data

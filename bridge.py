@@ -24,6 +24,7 @@ import base64
 import asyncio
 import logging
 import time
+import sqlite3
 from dataclasses import dataclass, field
 import aiohttp
 from telegram import Update, Bot
@@ -92,6 +93,74 @@ logger = logging.getLogger("bridge")
 
 # ─── Queue System ────────────────────────────────────────────────────────────
 
+# Database for dashboard
+DB_PATH = "/app/data/bridge_logs.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            user_id INTEGER,
+            user_name TEXT,
+            group_name TEXT,
+            message_preview TEXT,
+            has_attachment INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'queued',
+            attempts INTEGER DEFAULT 0,
+            error TEXT,
+            delivered_at REAL
+        )
+    """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON message_logs(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON message_logs(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_group ON message_logs(group_name)")
+    conn.commit()
+    conn.close()
+
+
+def db_insert_message(user_id, user_name, group_name, preview, has_attachment=False):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            "INSERT INTO message_logs (timestamp, user_id, user_name, group_name, message_preview, has_attachment, status) VALUES (?, ?, ?, ?, ?, ?, 'queued')",
+            (
+                time.time(),
+                user_id,
+                user_name,
+                group_name,
+                preview[:200],
+                int(has_attachment),
+            ),
+        )
+        log_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return log_id
+    except Exception as e:
+        logger.error(f"DB insert error: {e}")
+        return None
+
+
+def db_update_message(log_id, status, attempts=1, error=None):
+    if not log_id:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        delivered = time.time() if status == "sent" else None
+        conn.execute(
+            "UPDATE message_logs SET status=?, attempts=?, error=?, delivered_at=? WHERE id=?",
+            (status, attempts, error, delivered, log_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB update error: {e}")
+
 
 @dataclass
 class QueuedMessage:
@@ -105,6 +174,7 @@ class QueuedMessage:
     original_text: str  # original user message (for failure notice)
     queued_at: float = field(default_factory=time.time)
     attempts: int = 0
+    db_log_id: int | None = None  # SQLite log row ID
 
 
 # Global queue and stats
@@ -170,6 +240,7 @@ async def queue_worker(worker_id: int):
 
             if success:
                 stats["sent"] += 1
+                db_update_message(msg.db_log_id, "sent", msg.attempts)
                 logger.info(
                     f"[Worker #{worker_id}] ✅ Sent to [{msg.group_name}] "
                     f"(attempt {msg.attempts}, queue size: {message_queue.qsize()})"
@@ -190,11 +261,13 @@ async def queue_worker(worker_id: int):
             else:
                 # All retries exhausted
                 stats["failed"] += 1
+                db_update_message(
+                    msg.db_log_id, "failed", msg.attempts, "Timed out after all retries"
+                )
                 logger.error(
                     f"[Worker #{worker_id}] ❌ Failed after {MAX_RETRIES} attempts "
                     f"for [{msg.group_name}]"
                 )
-                # Notify user with their original message so they can resend manually
                 fail_text = (
                     f"❌ Failed to deliver to [{msg.group_name}] after {MAX_RETRIES} attempts.\n\n"
                     f"Your original message:\n"
@@ -208,6 +281,7 @@ async def queue_worker(worker_id: int):
         except Exception as e:
             logger.error(f"[Worker #{worker_id}] Unexpected error: {e}")
             stats["failed"] += 1
+            db_update_message(msg.db_log_id, "failed", msg.attempts, str(e))
         finally:
             message_queue.task_done()
 
@@ -218,9 +292,20 @@ async def enqueue_message(
     group_name: str,
     text: str,
     original_text: str,
+    user_id: int = 0,
+    user_name: str = "Unknown",
     base64_attachments: list[str] | None = None,
 ):
-    """Add a message to the send queue."""
+    """Add a message to the send queue and log to DB."""
+    # Log to database
+    log_id = db_insert_message(
+        user_id=user_id,
+        user_name=user_name,
+        group_name=group_name,
+        preview=original_text,
+        has_attachment=base64_attachments is not None,
+    )
+
     msg = QueuedMessage(
         chat_id=chat_id,
         group_id=group_id,
@@ -228,6 +313,7 @@ async def enqueue_message(
         text=text,
         base64_attachments=base64_attachments,
         original_text=original_text,
+        db_log_id=log_id,
     )
     await message_queue.put(msg)
     stats["queued"] += 1
@@ -573,12 +659,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     attachments = [attachment] if attachment else None
 
     # Queue it — user gets instant response
+    user_name = users_data[user_id].get("name", "Unknown")
     await enqueue_message(
         chat_id=user_id,
         group_id=group_id,
         group_name=group_name,
         text=text,
         original_text=original_text,
+        user_id=user_id,
+        user_name=user_name,
         base64_attachments=attachments,
     )
 
@@ -621,6 +710,7 @@ def main():
     validate_config()
     load_users()
     load_groups_config()
+    init_db()
 
     logger.info("Starting Telegram → Signal bridge (queued, multi-group)...")
     logger.info(f"Signal API: {SIGNAL_API_URL}")
